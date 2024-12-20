@@ -1,0 +1,25 @@
+version: "3.7"
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto
+    hostname: mosquitto
+    container_name: mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+
+  guardian-daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: guardian-daemon
+    depends_on:
+      - mosquitto
+    restart: unless-stopped
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+    links:
+      - mosquitto

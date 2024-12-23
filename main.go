@@ -358,36 +358,65 @@ func batchInsertIntoSupabase(deviceLogs []*DeviceLog) error {
 	return nil
 }
 
+const (
+	workerScaleThreshold = 0.8 // 80% of maxWorkers
+	queueOverloadThreshold = 0.8 // 80% of queue capacity
+)
+
 // monitorAndScaleWorkers dynamically scales the number of workers based on the taskQueue size
 func monitorAndScaleWorkers() {
 	for {
 		queueSize := len(taskQueue)
+		currentWorkers := len(activeWorkers)
+		workerCapacity := float64(maxWorkers) * workerScaleThreshold
+		queueCapacity := float64(cap(taskQueue)) * queueOverloadThreshold
 
 		workerLock.Lock()
-		// Scale up if the queue size exceeds the number of active workers and maxWorkers not reached
-		if queueSize > len(activeWorkers) && len(activeWorkers) < maxWorkers {
+
+		// Log if worker count exceeds threshold
+		if float64(currentWorkers) > workerCapacity {
+			log.Printf("⚠️ WARNING: Worker pool is at %.0f%% capacity (%d/%d workers in use).", (float64(currentWorkers)/float64(maxWorkers))*100, currentWorkers, maxWorkers)
+		}
+
+		// Log if worker count hits max capacity
+		if currentWorkers >= maxWorkers {
+			log.Printf("🚨 ALERT: Worker pool has reached max capacity (%d/%d workers). Incoming tasks may experience delays.", currentWorkers, maxWorkers)
+		}
+
+		// Scale up workers if needed
+		if queueSize > currentWorkers && currentWorkers < maxWorkers {
 			workerIDCounter++
 			newWorkerID := workerIDCounter
 			stopWorkerCh := make(chan bool)
 			activeWorkers[newWorkerID] = stopWorkerCh
 			wg.Add(1)
 			go worker(newWorkerID, stopWorkerCh)
-			log.Printf("Scaled up: Started worker %d. Total workers: %d", newWorkerID, len(activeWorkers))
+			log.Printf("🔼 Scaled up: Started worker %d. Total workers: %d", newWorkerID, len(activeWorkers))
 		}
 
-		// Scale down if the queue size is less than the number of active workers and above minWorkers
+		// Scale down workers if queue is small and above minWorkers
 		if queueSize < len(activeWorkers) && len(activeWorkers) > minWorkers {
 			for workerID, stopCh := range activeWorkers {
 				if len(activeWorkers) > minWorkers {
 					close(stopCh)
 					delete(activeWorkers, workerID)
-					log.Printf("Scaled down: Stopped worker %d. Total workers: %d", workerID, len(activeWorkers))
+					log.Printf("🔽 Scaled down: Stopped worker %d. Total workers: %d", workerID, len(activeWorkers))
 					break
 				}
 			}
 		}
-		workerLock.Unlock()
 
+		// Log if queue is nearing capacity
+		if float64(queueSize) > queueCapacity {
+			log.Printf("⚠️ WARNING: Task queue is at %.0f%% capacity (%d/%d tasks in queue).", (float64(queueSize)/float64(cap(taskQueue)))*100, queueSize, cap(taskQueue))
+		}
+
+		// Log if the queue is full
+		if queueSize == cap(taskQueue) {
+			log.Printf("🚨 ALERT: Task queue is FULL (%d tasks). Incoming messages may be dropped.", queueSize)
+		}
+
+		workerLock.Unlock()
 		time.Sleep(2 * time.Second) // Adjust scaling interval as needed
 	}
 }

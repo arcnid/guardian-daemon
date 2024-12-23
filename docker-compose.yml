@@ -23,3 +23,5 @@ services:
       - SUPABASE_KEY=${SUPABASE_KEY}
     links:
       - mosquitto
+    volumes:
+      - ./logs:/app/logs

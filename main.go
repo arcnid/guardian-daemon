@@ -61,7 +61,7 @@ func main() {
 	go monitorAndScaleWorkers()
 
 	// Set up MQTT client
-	broker := "tcp://localhost:1883"
+	broker := "tcp://mosquitto:1883"
 	clientID := "guardian-daemon"
 
 	opts := mqtt.NewClientOptions().

@@ -29,9 +29,10 @@ services:
       - mosquitto
     volumes:
       - ./logs:/app/logs
-    networks: 
+    networks:
       - guardian-daemon-net
-
+    ports:
+      - "5000:5000"
 
 networks:
   guardian-daemon-net:

@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -52,6 +54,90 @@ var (
 	defaultDeviceType = "relay"                   // Default device_type for plain text payloads
 )
 
+
+var (
+	mqttClientInstance mqtt.Client
+	mqttOnce           sync.Once
+)
+
+
+func getMQTTClient() mqtt.Client {
+	mqttOnce.Do(func() {
+		broker := "tcp://mosquitto:1883"
+		clientID := "guardian-daemon"
+
+		opts := mqtt.NewClientOptions().
+			AddBroker(broker).
+			SetClientID(clientID).
+			SetDefaultPublishHandler(messageHandler)
+
+		client := mqtt.NewClient(opts)
+		if token := client.Connect(); token.Wait() && token.Error() != nil {
+			log.Fatalf("Failed to connect to MQTT broker: %v", token.Error())
+		}
+		log.Println("Connected to MQTT broker!")
+		mqttClientInstance = client
+	})
+	return mqttClientInstance
+}
+
+func handleSendCommand(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "Invalid request method. Only POST is allowed.", http.StatusMethodNotAllowed)
+        return
+    }
+
+    // Parse the incoming JSON
+    var message struct {
+        DeviceID string                 `json:"deviceId"`
+        UserID   string                 `json:"userId"`
+        Data     map[string]interface{} `json:"data"` // Dynamic key-value structure
+    }
+    if err := json.NewDecoder(r.Body).Decode(&message); err != nil {
+        log.Printf("Error decoding request body: %v", err)
+        http.Error(w, "Invalid JSON format.", http.StatusBadRequest)
+        return
+    }
+    defer r.Body.Close()
+
+    // Validate required fields
+    if message.DeviceID == "" || message.UserID == "" || message.Data == nil {
+        http.Error(w, "Missing required fields: deviceId, userId, or data.", http.StatusBadRequest)
+        return
+    }
+
+    // Serialize the Data object into a JSON string
+    dataJSON, err := json.Marshal(message.Data)
+    if err != nil {
+        log.Printf("Error serializing data to JSON: %v", err)
+        http.Error(w, "Failed to serialize data to JSON.", http.StatusInternalServerError)
+        return
+    }
+
+    // Construct the MQTT topic
+    topic := fmt.Sprintf("/toDevice/%s/%s", message.UserID, message.DeviceID)
+
+    // Publish the message to MQTT
+    client := getMQTTClient() // Ensure singleton MQTT client is initialized
+    token := client.Publish(topic, 0, false, dataJSON)
+    token.Wait()
+
+    if token.Error() != nil {
+        log.Printf("Failed to publish MQTT message: %v", token.Error())
+        http.Error(w, "Failed to publish MQTT message.", http.StatusInternalServerError)
+        return
+    }
+
+    // Respond to the client
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusOK)
+    response := map[string]string{
+        "status": "success",
+        "topic":  topic,
+        "message": fmt.Sprintf("Message successfully published to topic %s", topic),
+    }
+    json.NewEncoder(w).Encode(response)
+}
 // main function initializes the application
 func main() {
 	// Initialize Supabase client
@@ -60,32 +146,27 @@ func main() {
 	// Start dynamic scaling of workers
 	go monitorAndScaleWorkers()
 
-	// Set up MQTT client
-	broker := "tcp://mosquitto:1883"
-	clientID := "guardian-daemon"
-
-	opts := mqtt.NewClientOptions().
-		AddBroker(broker).
-		SetClientID(clientID).
-		SetDefaultPublishHandler(messageHandler)
-
 	// Create the MQTT client
-	client := mqtt.NewClient(opts)
+	client := getMQTTClient()
 
 	// Connect to the MQTT broker
-	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		log.Fatalf("Failed to connect to MQTT broker: %v", token.Error())
-	}
-	log.Println("Connected to MQTT broker!")
-
-	// Subscribe to all topics
-	if token := client.Subscribe("#", 0, nil); token.Wait() && token.Error() != nil {
-		log.Fatalf("Failed to subscribe: %v", token.Error())
-	}
-	log.Println("Subscribed to all topics!")
+	if token := client.Subscribe("/toDaemon/#", 0, nil); token.Wait() && token.Error() != nil {
+        log.Fatalf("Failed to subscribe to all topics: %v", token.Error())
+    }
+    log.Println("Subscribed to all topics!")
 
 	// Handle graceful shutdown
 	setupGracefulShutdown(client)
+
+	//init http server
+
+	http.HandleFunc("/sendComand", handleSendCommand)
+
+	fmt.Println("Starting server on :5000...")
+	err := http.ListenAndServe(":5000", nil)
+	if err != nil {
+		fmt.Println("Error starting server:", err)
+	}
 
 	// Keep the program running indefinitely
 	select {}

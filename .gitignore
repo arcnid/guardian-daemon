@@ -1,3 +1,4 @@
 .env
 failed_messages.log
 guardian-daemon.exe
+GuardianBackend.pem

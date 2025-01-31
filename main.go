@@ -82,6 +82,21 @@ func getMQTTClient() mqtt.Client {
 }
 
 func handleSendCommand(w http.ResponseWriter, r *http.Request) {
+    // Handle CORS Preflight Request
+    if r.Method == http.MethodOptions {
+        w.Header().Set("Access-Control-Allow-Origin", "*")
+        w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+        w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+        w.WriteHeader(http.StatusOK)
+        return
+    }
+
+    // Set CORS headers
+    w.Header().Set("Access-Control-Allow-Origin", "*")
+    w.Header().Set("Access-Control-Allow-Methods", "POST")
+    w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+    w.Header().Set("Content-Type", "application/json")
+
     if r.Method != http.MethodPost {
         http.Error(w, "Invalid request method. Only POST is allowed.", http.StatusMethodNotAllowed)
         return
@@ -91,8 +106,9 @@ func handleSendCommand(w http.ResponseWriter, r *http.Request) {
     var message struct {
         DeviceID string                 `json:"deviceId"`
         UserID   string                 `json:"userId"`
-        Data     map[string]interface{} `json:"data"` // Dynamic key-value structure
+        Data     map[string]interface{} `json:"data"`
     }
+
     if err := json.NewDecoder(r.Body).Decode(&message); err != nil {
         log.Printf("Error decoding request body: %v", err)
         http.Error(w, "Invalid JSON format.", http.StatusBadRequest)
@@ -118,7 +134,7 @@ func handleSendCommand(w http.ResponseWriter, r *http.Request) {
     topic := fmt.Sprintf("/toDevice/%s/%s", message.UserID, message.DeviceID)
 
     // Publish the message to MQTT
-    client := getMQTTClient() // Ensure singleton MQTT client is initialized
+    client := getMQTTClient()
     token := client.Publish(topic, 0, false, dataJSON)
     token.Wait()
 
@@ -129,8 +145,6 @@ func handleSendCommand(w http.ResponseWriter, r *http.Request) {
     }
 
     // Respond to the client
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(http.StatusOK)
     response := map[string]string{
         "status": "success",
         "topic":  topic,
@@ -138,6 +152,7 @@ func handleSendCommand(w http.ResponseWriter, r *http.Request) {
     }
     json.NewEncoder(w).Encode(response)
 }
+
 // main function initializes the application
 func main() {
 	// Initialize Supabase client

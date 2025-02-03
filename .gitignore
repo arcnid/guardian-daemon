@@ -2,3 +2,4 @@
 failed_messages.log
 guardian-daemon.exe
 GuardianBackend.pem
+buildDaemon.sh

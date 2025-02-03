@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -16,6 +17,9 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/joho/godotenv"
 	"github.com/nedpals/supabase-go"
+
+	// Import the Expo push notification SDK
+	expo "github.com/oliveroneill/exponent-server-sdk-golang/sdk"
 )
 
 // DeviceLog represents the structure of an device log entry
@@ -196,7 +200,6 @@ func handleSendCommand(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// main function initializes the application
 func main() {
 	// Initialize Supabase client
 	initSupabase()
@@ -268,63 +271,61 @@ func initSupabase() {
 	})
 }
 
-// worker processes tasks from the taskQueue
-func worker(id int, stopWorkerCh chan bool) {
-	log.Printf("Worker %d started", id)
-	defer wg.Done()
-
-	batch := []*DeviceLog{}
-	batchSize := 10                  // Number of logs per batch
-	batchInterval := 5 * time.Second // Time interval to flush batch
-	ticker := time.NewTicker(batchInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case task := <-taskQueue:
-			log.Printf("Worker %d processing task: %s on topic %s", id, task.Payload, task.Topic)
-			deviceLog, err := parsePayload(task.Topic, task.Payload)
-			if err != nil {
-				log.Printf("Worker %d failed to parse payload: %v", id, err)
-				continue
+// getFloatFromPayload extracts a float64 from the payload for the given key.
+func getFloatFromPayload(payload map[string]interface{}, key string) (float64, bool) {
+	if val, exists := payload[key]; exists {
+		switch v := val.(type) {
+		case float64:
+			return v, true
+		case float32:
+			return float64(v), true
+		case int:
+			return float64(v), true
+		case string:
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				return f, true
 			}
-			batch = append(batch, deviceLog)
-
-			if len(batch) >= batchSize {
-				err := batchInsertIntoSupabase(batch)
-				if err != nil {
-					log.Printf("Worker %d failed to batch insert: %v", id, err)
-				} else {
-					log.Printf("Worker %d successfully batch inserted %d tasks", id, len(batch))
-				}
-				batch = []*DeviceLog{} // Reset batch
-			}
-
-		case <-ticker.C:
-			if len(batch) > 0 {
-				err := batchInsertIntoSupabase(batch)
-				if err != nil {
-					log.Printf("Worker %d failed to batch insert: %v", id, err)
-				} else {
-					log.Printf("Worker %d successfully batch inserted %d tasks", id, len(batch))
-				}
-				batch = []*DeviceLog{} // Reset batch
-			}
-
-		case <-stopWorkerCh:
-			log.Printf("Worker %d stopping", id)
-			// Insert any remaining logs before exiting
-			if len(batch) > 0 {
-				err := batchInsertIntoSupabase(batch)
-				if err != nil {
-					log.Printf("Worker %d failed to batch insert during shutdown: %v", id, err)
-				} else {
-					log.Printf("Worker %d successfully batch inserted %d tasks during shutdown", id, len(batch))
-				}
-			}
-			return
 		}
 	}
+	return 0, false
+}
+
+// worker processes tasks from the taskQueue
+func worker(id int, stopWorkerCh chan bool) {
+    log.Printf("Worker %d started", id)
+    defer wg.Done()
+
+    defer func() {
+        if r := recover(); r != nil {
+            log.Printf("Worker %d recovered from panic: %v", id, r)
+        }
+    }()
+
+    for {
+        select {
+        case task := <-taskQueue:
+            log.Printf("Worker %d processing task: %s on topic %s", id, task.Payload, task.Topic)
+            defer func() {
+                if r := recover(); r != nil {
+                    log.Printf("Worker %d recovered from panic: %v", id, r)
+                }
+            }()
+            deviceLog, err := parsePayload(task.Topic, task.Payload)
+            if err != nil {
+                log.Printf("Worker %d failed to parse payload: %v", id, err)
+                continue
+            }
+
+            err = insertIntoSupabase(deviceLog)
+            if err != nil {
+                log.Printf("Worker %d failed to insert into Supabase: %v", id, err)
+            }
+
+        case <-stopWorkerCh:
+            log.Printf("Worker %d stopping", id)
+            return
+        }
+    }
 }
 
 // parsePayload parses the MQTT payload and returns a DeviceLog struct
@@ -409,7 +410,6 @@ func parsePayload(topic, payload string) (*DeviceLog, error) {
 // createDummyDeviceLog creates a DeviceLog with dummy data
 func createDummyDeviceLog(topic, payload string) *DeviceLog {
 	// Extract user_id from topic
-	// Assuming the topic format is "/gms/user/{user_id}/log"
 	parts := strings.Split(topic, "/")
 	userID := ""
 	for i, part := range parts {
@@ -441,7 +441,6 @@ func createDummyDeviceLog(topic, payload string) *DeviceLog {
 		DeviceType: deviceType,
 		RelayState: relayState,
 		Metadata:   metadata,
-		// Other fields remain nil or default
 	}
 }
 
@@ -592,9 +591,10 @@ func updateAutomationLastExecuted(automationID string, ts time.Time) error {
 	data := map[string]interface{}{
 		"last_executed": ts.Format(time.RFC3339),
 	}
-	res := supabaseClient.DB.From("user_automations").Update(data).Eq("id", automationID).Execute(data)
-	if res.Error() != "" { // Call the function
-		errStr := res.Error() // get the error string
+	// Pass a pointer to data for Execute()
+	res := supabaseClient.DB.From("user_automations").Update(data).Eq("id", automationID).Execute(&data)
+	if res.Error() != "" {
+		errStr := res.Error()
 		log.Printf("Error updating automation %s: %v", automationID, errStr)
 		return errors.New(errStr)
 	}
@@ -617,19 +617,45 @@ func evaluateSensorTrigger(trigger Trigger) bool {
 }
 
 // evaluateTriggers is used for non-scheduled (device-based) triggers.
-// It iterates over the triggers and evaluates, for example, sensor-based triggers.
-func evaluateTriggers(triggers []Trigger) bool {
-	for _, trigger := range triggers {
-		switch trigger.Type {
-		case "Sensor":
-			if evaluateSensorTrigger(trigger) {
-				return true
-			}
+// It iterates through device-based triggers (ignoring scheduled ones)
+// and combines their results. If more than one trigger is defined, the optional
+// ConditionOperator field ("and" or "or") is used to combine the booleans.
+func evaluateTriggers(triggers []Trigger, payload map[string]interface{}) bool {
+	var result bool
+	for i, trigger := range triggers {
+		var current bool
+		switch strings.ToLower(trigger.Type) {
+		case "single_device":
+			current = validateSingleDeviceTrigger(trigger, payload)
+		case "two_device_diff":
+			current = handleTwoDeviceCompareTrigger(trigger, payload)
+		// Skip scheduled triggers for device-based evaluation.
+		case "scheduled":
+			current = false
 		default:
-			log.Printf("Unknown or unhandled trigger type in device automation: %s", trigger.Type)
+			log.Printf("Unknown trigger type in device automation: %s", trigger.Type)
+			current = false
+		}
+		// For the first trigger, simply assign.
+		if i == 0 {
+			result = current
+		} else {
+			// If the trigger has a ConditionOperator, combine the result accordingly.
+			op := "and"
+			if trigger.ConditionOperator != nil {
+				op = strings.ToLower(*trigger.ConditionOperator)
+			}
+			if op == "and" {
+				result = result && current
+			} else if op == "or" {
+				result = result || current
+			} else {
+				log.Printf("Unknown condition operator '%s'; defaulting to AND", op)
+				result = result && current
+			}
 		}
 	}
-	return false
+	return result
 }
 
 func mapTimezoneOffset(tz string) int {
@@ -644,8 +670,8 @@ func mapTimezoneOffset(tz string) int {
 		// Central Time Zone
 		"America/Chicago":             -6,
 		"America/Winnipeg":            -6,
-		"America/Regina":              -6, // Note: Regina does not observe DST.
-		"America/Indiana/Indianapolis": -5, // Most of Indiana uses Eastern time.
+		"America/Regina":              -6,
+		"America/Indiana/Indianapolis": -5,
 		"America/Indiana/Marengo":     -5,
 		"America/Indiana/Petersburg":  -5,
 		"America/Indiana/Tell_City":   -6,
@@ -656,7 +682,7 @@ func mapTimezoneOffset(tz string) int {
 		// Mountain Time Zone
 		"America/Denver":   -6,
 		"America/Edmonton": -6,
-		"America/Phoenix":  -7, // Arizona does not use DST.
+		"America/Phoenix":  -7,
 		// Pacific Time Zone
 		"America/Los_Angeles": -8,
 		"America/Vancouver":   -8,
@@ -668,7 +694,7 @@ func mapTimezoneOffset(tz string) int {
 		// Atlantic Time Zone (Canada)
 		"America/Halifax": -4,
 		// Newfoundland (approximation)
-		"America/St_Johns": -3, // Actually -3.5; approximated here as -3.
+		"America/St_Johns": -3,
 	}
 	if offset, ok := mapping[tz]; ok {
 		return offset
@@ -677,24 +703,20 @@ func mapTimezoneOffset(tz string) int {
 }
 
 // evaluateScheduledTrigger checks if the scheduled trigger should fire.
-// It verifies:
-//  1. Today is one of the trigger's days_of_week (using the automation's fixed timezone).
-//  2. The current time (in the automation's timezone) is within a tolerance of the trigger's common_time.
-//  3. The automation has not been executed too recently (within 5 minutes).
 func evaluateScheduledTrigger(automation Automation, trigger Trigger) bool {
-	// Get the offset (in hours) for the automation's timezone.
+	// Calculate timezone offset and create a fixed zone
 	offsetHours := mapTimezoneOffset(automation.Timezone)
-	// Create a fixed time zone using the offset.
 	loc := time.FixedZone(automation.Timezone, offsetHours*3600)
 
-	// Print out the local time in the automation's timezone.
-	log.Printf("Local time in %s is %s", automation.Timezone, time.Now().In(loc).Format("15:04"))
+	// Get the current time in the fixed timezone
+	localNow := time.Now().In(loc)
+	log.Printf("DEBUG: Current local time in %s: %s", automation.Timezone, localNow.Format("15:04:05"))
 
-	// Get the current time in the fixed zone.
-	now := time.Now().In(loc)
-	currentDay := now.Weekday().String() // e.g. "Monday"
+	// Log current day and scheduled days from trigger
+	currentDay := localNow.Weekday().String()
+	log.Printf("DEBUG: Current day: %s, Trigger days: %v", currentDay, trigger.DaysOfWeek)
 
-	// Check if today is in the trigger's days_of_week.
+	// Check if today's day is one of the trigger days
 	found := false
 	for _, day := range trigger.DaysOfWeek {
 		if strings.EqualFold(day, currentDay) {
@@ -703,57 +725,58 @@ func evaluateScheduledTrigger(automation Automation, trigger Trigger) bool {
 		}
 	}
 	if !found {
-		log.Printf("Today (%s) is not in the scheduled days %v", currentDay, trigger.DaysOfWeek)
+		log.Printf("DEBUG: Today (%s) is not in the scheduled days %v", currentDay, trigger.DaysOfWeek)
 		return false
 	}
 
-	// Ensure common_time is specified.
+	// Ensure a common_time is specified
 	if trigger.CommonTime == nil {
-		log.Printf("No common_time specified in trigger")
+		log.Printf("DEBUG: No common_time specified in trigger")
 		return false
 	}
 	commonTimeStr := *trigger.CommonTime
-	// Parse common_time (expected format "15:04").
 	commonTime, err := time.Parse("15:04", commonTimeStr)
 	if err != nil {
-		log.Printf("Error parsing common_time %s: %v", commonTimeStr, err)
+		log.Printf("DEBUG: Error parsing common_time '%s': %v", commonTimeStr, err)
 		return false
 	}
-	// Create a time.Time for today using the hour and minute from common_time.
-	scheduledTime := time.Date(now.Year(), now.Month(), now.Day(), commonTime.Hour(), commonTime.Minute(), 0, 0, loc)
 
-	// Set tolerance to 3 minutes.
+	// Build the scheduled time for today using the parsed common time
+	scheduledTime := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), commonTime.Hour(), commonTime.Minute(), 0, 0, loc)
+	log.Printf("DEBUG: Scheduled time: %s", scheduledTime.Format("15:04:05"))
+
+	// Set tolerance and compute difference
 	tolerance := 3 * time.Minute
-	diff := now.Sub(scheduledTime)
+	diff := localNow.Sub(scheduledTime)
 	if diff < 0 {
 		diff = -diff
 	}
+	log.Printf("DEBUG: Time difference: %v, Tolerance: %v", diff, tolerance)
 	if diff > tolerance {
-		log.Printf("Current time (%s) is not within tolerance of scheduled time (%s)", now.Format("15:04"), scheduledTime.Format("15:04"))
+		log.Printf("DEBUG: Current time (%s) is not within tolerance of scheduled time (%s)", localNow.Format("15:04:05"), scheduledTime.Format("15:04:05"))
 		return false
 	}
 
-	// Check if automation was executed too recently (within 3 minutes).
+	// If automation has been executed before, check the delta
 	if automation.LastExecuted != nil {
 		lastExec := automation.LastExecuted.In(loc)
-		if now.Sub(lastExec) < 3*time.Minute {
-			log.Printf("Automation executed recently at %s", lastExec.Format("15:04"))
+		log.Printf("DEBUG: Last executed time: %s", lastExec.Format("15:04:05"))
+		delta := localNow.Sub(lastExec)
+		log.Printf("DEBUG: Time since last execution: %v", delta)
+		if delta < 5*time.Minute {
+			log.Printf("DEBUG: Automation executed too recently; delta %v is less than threshold 3m", delta)
 			return false
 		}
 	}
 
-	// All checks passed.
 	return true
 }
 
 func scheduleHandler() {
-	ticker := time.NewTicker(1 * time.Minute) // Runs every 60 seconds
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
-
 	for range ticker.C {
 		log.Println("Scheduled Handler: Checking for scheduled automations...")
-
-		// Query Supabase for scheduled automations
 		var automations []Automation
 		err := supabaseClient.DB.From("user_automations").
 			Select("*").
@@ -763,27 +786,21 @@ func scheduleHandler() {
 			log.Printf("❌ Error fetching scheduled automations: %v", err)
 			continue
 		}
-
 		log.Printf("✅ Found %d scheduled automations", len(automations))
-
-		// Process each automation
 		for _, automation := range automations {
-			// Log full automation object as JSON
 			b, err := json.MarshalIndent(automation, "", "  ")
 			if err != nil {
 				log.Printf("Error marshalling automation: %v", err)
 			} else {
 				log.Printf("🕛 Processing scheduled automation: %s", b)
 			}
-			// For each scheduled trigger in the automation, check if it should fire.
 			for _, trigger := range automation.Triggers {
 				if trigger.Type == "scheduled" {
 					if evaluateScheduledTrigger(automation, trigger) {
-						// Update the automation's last_executed field before executing actions.
 						updateAutomationLastExecuted(automation.ID, time.Now().UTC())
 						log.Printf("Executing scheduled automation: %s", automation.ID)
-						executeActions(automation.Actions)
-						break // Execute once per automation.
+						executeActions(automation.Actions, automation.UserID)
+						break
 					}
 				}
 			}
@@ -791,15 +808,268 @@ func scheduleHandler() {
 	}
 }
 
-func executeActions(actions []Action) {
+// sendPushNotificationForUser queries the notifications table and sends a push notification using the Expo SDK.
+func sendPushNotificationForUser(userID, title, message string, data map[string]string) error {
+	var notifications []struct {
+		ExpoPushToken string `json:"expo_push_token"`
+	}
+	err := supabaseClient.DB.From("notifications").
+		Select("expo_push_token").
+		Eq("user_id", userID).
+		Execute(&notifications)
+	if err != nil {
+		log.Printf("Error querying notifications for user %s: %v", userID, err)
+		return err
+	}
+	if len(notifications) == 0 {
+		log.Printf("No push tokens found for user %s", userID)
+		return nil
+	}
+	for _, notif := range notifications {
+		token := notif.ExpoPushToken
+		if !strings.HasPrefix(token, "ExponentPushToken[") {
+			token = fmt.Sprintf("ExponentPushToken[%s]", token)
+		}
+		pushToken, err := expo.NewExponentPushToken(token)
+		if err != nil {
+			log.Printf("Invalid push token %s: %v", token, err)
+			continue
+		}
+		pushMessage := expo.PushMessage{
+			To:       []expo.ExponentPushToken{pushToken},
+			Title:    title,
+			Body:     message,
+			Sound:    "default",
+			Data:     data,
+			Priority: expo.DefaultPriority,
+		}
+		client := expo.NewPushClient(nil)
+		resp, err := client.Publish(&pushMessage)
+		if err != nil {
+			log.Printf("Error sending push notification to token %s: %v", token, err)
+			continue
+		}
+		if resp.ValidateResponse() != nil {
+			log.Printf("Push notification to %s failed: %+v", token, resp)
+		} else {
+			log.Printf("Push notification sent successfully to %s, response: %+v", token, resp)
+		}
+	}
+	return nil
+}
+
+// validateSingleDeviceTrigger checks a "single_device" trigger against the device payload.
+func validateSingleDeviceTrigger(trigger Trigger, payload map[string]interface{}) bool {
+	// (Optional) Check that the payload comes from the expected device.
+	if trigger.DeviceID != nil && *trigger.DeviceID != "" {
+		payloadDeviceID, ok := payload["device_id"].(string)
+		if !ok || payloadDeviceID != *trigger.DeviceID {
+			log.Printf("Single device trigger: payload device (%s) does not match trigger device (%s)", payloadDeviceID, *trigger.DeviceID)
+			return false
+		}
+	}
+
+	// Determine which metric to check.
+	if trigger.Metric == nil {
+		log.Println("Single device trigger: no metric specified")
+		return false
+	}
+	metric := strings.ToLower(*trigger.Metric)
+	var sensorKey string
+	switch metric {
+	case "temp":
+		sensorKey = "temp_sensor_reading"
+	case "humidity":
+		sensorKey = "humid_sensor_reading"
+	default:
+		log.Printf("Single device trigger: unknown metric %s", metric)
+		return false
+	}
+
+	// Get the sensor value from the payload.
+	sensorValue, ok := getFloatFromPayload(payload, sensorKey)
+	if !ok {
+		log.Printf("Single device trigger: could not retrieve sensor value for key %s", sensorKey)
+		return false
+	}
+
+	// Parse the trigger value (which is provided as a string).
+	if trigger.Value == nil {
+		log.Println("Single device trigger: no value specified")
+		return false
+	}
+	triggerValue, err := strconv.ParseFloat(*trigger.Value, 64)
+	if err != nil {
+		log.Printf("Single device trigger: error parsing trigger value '%s': %v", *trigger.Value, err)
+		return false
+	}
+
+	// Evaluate the condition.
+	if trigger.Condition != nil {
+		cond := strings.ToLower(*trigger.Condition)
+		switch cond {
+		case "gt":
+			return sensorValue > triggerValue
+		case "lt":
+			return sensorValue < triggerValue
+		case "eq":
+			return sensorValue == triggerValue
+		case "gte":
+			return sensorValue >= triggerValue
+		case "lte":
+			return sensorValue <= triggerValue
+		default:
+			log.Printf("Single device trigger: unknown condition operator '%s'", cond)
+			return false
+		}
+	}
+
+	return false
+}
+
+// handleTwoDeviceCompareTrigger compares the reading from the device that sent the payload
+// with the latest reading of the other device as stored in your Supabase table.
+func handleTwoDeviceCompareTrigger(trigger Trigger, payload map[string]interface{}) bool {
+    if trigger.Device1 == nil || trigger.Device2 == nil {
+        log.Println("Two device trigger: Device1 or Device2 is nil")
+        return false
+    }
+
+    payloadDeviceID, ok := payload["device_id"].(string)
+    if !ok || payloadDeviceID == "" {
+        log.Println("Two device trigger: payload missing device_id")
+        return false
+    }
+
+    if trigger.Metric == nil {
+        log.Println("Two device trigger: Metric field is nil")
+        return false
+    }
+
+    metric := strings.ToLower(*trigger.Metric)
+    var sensorKey string
+    switch metric {
+    case "temp":
+        sensorKey = "temp_sensor_reading"
+    case "humidity":
+        sensorKey = "humid_sensor_reading"
+    default:
+        log.Printf("Two device trigger: unknown metric %s", metric)
+        return false
+    }
+
+    var otherDeviceID string
+    if trigger.Device1.DeviceID == payloadDeviceID {
+        otherDeviceID = trigger.Device2.DeviceID
+    } else if trigger.Device2.DeviceID == payloadDeviceID {
+        otherDeviceID = trigger.Device1.DeviceID
+    } else {
+        log.Println("Two device trigger: Payload does not match Device1 or Device2")
+        return false
+    }
+
+    // Get current sensor value
+    currentValue, ok := getFloatFromPayload(payload, sensorKey)
+    if !ok {
+        log.Printf("Two device trigger: could not retrieve sensor value for %s", sensorKey)
+        return false
+    }
+
+    // Fetch latest log from Supabase
+    var logs []DeviceLog
+    res := supabaseClient.DB.From("deviceLogs").Select("*").
+        OrderBy("created_at", "desc").Limit(1).
+        Eq("device_id", otherDeviceID).
+        Execute(&logs)
+
+    if res.Error() != "" || len(logs) == 0 {
+        log.Printf("Two device trigger: failed to fetch latest log for device %s", otherDeviceID)
+        return false
+    }
+
+    var otherValue float64
+    switch metric {
+    case "temp":
+        if logs[0].TempSensorReading != nil {
+            otherValue = *logs[0].TempSensorReading
+        } else {
+            log.Println("Two device trigger: Other device missing temp_sensor_reading")
+            return false
+        }
+    case "humidity":
+        if logs[0].HumidSensorReading != nil {
+            otherValue = *logs[0].HumidSensorReading
+        } else {
+            log.Println("Two device trigger: Other device missing humid_sensor_reading")
+            return false
+        }
+    default:
+        log.Println("Two device trigger: Unexpected metric type")
+        return false
+    }
+
+    // Compute absolute difference
+    diff := currentValue - otherValue
+    if diff < 0 {
+        diff = -diff
+    }
+
+    // Parse trigger value
+    if trigger.Value == nil {
+        log.Println("Two device trigger: Trigger value is nil")
+        return false
+    }
+
+    triggerValue, err := strconv.ParseFloat(*trigger.Value, 64)
+    if err != nil {
+        log.Printf("Two device trigger: Error parsing trigger value '%s': %v", *trigger.Value, err)
+        return false
+    }
+
+    // Evaluate condition
+    if trigger.Condition != nil {
+        cond := strings.ToLower(*trigger.Condition)
+        switch cond {
+        case "gt":
+            return diff > triggerValue
+        case "lt":
+            return diff < triggerValue
+        case "eq":
+            return diff == triggerValue
+        case "gte":
+            return diff >= triggerValue
+        case "lte":
+            return diff <= triggerValue
+        default:
+            log.Printf("Two device trigger: Unknown condition operator '%s'", cond)
+            return false
+        }
+    }
+
+    return false
+}
+
+
+
+func executeActions(actions []Action, userID string) {
 	for _, action := range actions {
 		switch action.Type {
 		case "send_notification":
-			log.Printf("Sending notification: %s", action.Message)
-			// Implement notification logic
+			log.Printf("Sending notification action: %s", action.Message)
+			title := "Notification"
+			msg := "You have a new notification."
+			if action.Message != nil && *action.Message != "" {
+				msg = *action.Message
+			}
+			// IMPORTANT: Replace "dummy-user-id" with the proper user ID from your context.
+			data := map[string]string{"info": "extra data if needed"}
+			err := sendPushNotificationForUser(userID, title, msg, data)
+			if err != nil {
+				log.Printf("Error sending notification for user %s: %v", userID, err)
+			}
 		case "turn_on_relay":
 			log.Printf("Turning on relay for device: %s", action.DeviceID)
-			// Implement relay logic
+			// Implement relay logic here.
 		default:
 			log.Printf("Unknown action type: %s", action.Type)
 		}
@@ -808,60 +1078,42 @@ func executeActions(actions []Action) {
 
 func deviceAutomationHandler(task Task) {
 	log.Printf("📡 Device Automation Handler: Processing message on topic %s", task.Topic)
-
-	// Declare a variable to hold the dynamic JSON payload
 	var payload map[string]interface{}
-
-	// Attempt to unmarshal the JSON payload
-	err := json.Unmarshal([]byte(task.Payload), &payload)
-	if err != nil {
+	if err := json.Unmarshal([]byte(task.Payload), &payload); err != nil {
 		log.Printf("❌ Error parsing JSON payload: %v", err)
 		return
 	}
-
-	// Print the extracted data
 	log.Println("✅ Parsed Device Data:")
 	for key, value := range payload {
 		log.Printf("  %s: %v", key, value)
 	}
-
-	// Extract `user_id` from the payload
 	userID, ok := payload["user_id"].(string)
 	if !ok || userID == "" {
 		log.Println("❌ Missing or invalid user_id in payload. Skipping automation processing.")
 		return
 	}
-
-	// Query Supabase for automations for this specific user
 	var automations []Automation
-	err = supabaseClient.DB.From("user_automations").
+	err := supabaseClient.DB.From("user_automations").
 		Select("*").
-		Eq("user_id", userID). // Fetch only automations for this user
+		Eq("user_id", userID).
 		Execute(&automations)
-
 	if err != nil {
 		log.Printf("❌ Error fetching automations for user %s: %v", userID, err)
 		return
 	}
-
 	log.Printf("📋 Found %d automations for user %s", len(automations), userID)
-
-	// Process each automation
 	for _, automation := range automations {
-		// Log full automation object as JSON
 		b, err := json.MarshalIndent(automation, "", "  ")
 		if err != nil {
 			log.Printf("Error marshalling automation: %v", err)
 		} else {
 			log.Printf("Processing automation: %s", b)
 		}
-
-		// For device-based triggers, use the existing evaluation logic.
-		if evaluateTriggers(automation.Triggers) {
-			// Update the automation's last_executed field before executing actions.
+		// Note: we now pass the payload to evaluateTriggers.
+		if evaluateTriggers(automation.Triggers, payload) {
 			updateAutomationLastExecuted(automation.ID, time.Now().UTC())
 			log.Printf("🚀 Executing automation: %s", automation.ID)
-			executeActions(automation.Actions)
+			executeActions(automation.Actions, automation.UserID)
 		} else {
 			log.Printf("❌ Automation %s did not meet trigger conditions", automation.ID)
 		}

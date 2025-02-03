@@ -334,81 +334,142 @@ func worker(id int, stopWorkerCh chan bool) {
 
 // parsePayload parses the MQTT payload and returns a DeviceLog struct
 func parsePayload(topic, payload string) (*DeviceLog, error) {
-	// Attempt to parse payload as JSON
-	var rawData map[string]interface{}
-	err := json.Unmarshal([]byte(payload), &rawData)
-	if err != nil {
-		// If payload is not JSON, insert dummy data
-		log.Printf("Payload is not JSON: %s. Inserting dummy data.", payload)
-		return createDummyDeviceLog(topic, payload), nil
-	}
+    // First, attempt to parse the payload as JSON.
+    var rawData map[string]interface{}
+    err := json.Unmarshal([]byte(payload), &rawData)
+    if err != nil {
+        // If the payload is not valid JSON, fall back to creating dummy data.
+        log.Printf("Payload is not JSON: %s. Inserting dummy data.", payload)
+        return createDummyDeviceLog(topic, payload), nil
+    }
 
-	// Helper function to extract string fields
-	getString := func(key string) string {
-		if val, exists := rawData[key]; exists {
-			if str, ok := val.(string); ok {
-				return str
-			}
-		}
-		return "" // Default to empty string if not present or not a string
-	}
+    // Check for the relay_update key.
+    if _, isRelayUpdate := rawData["relay_update"]; isRelayUpdate {
+        // Process as a relay update message.
+        // Extract fields from the JSON.
+        var (
+            deviceID   string
+            userID     string
+            status     string
+            relayState string // we'll represent it as "on" or "off"
+            devType    string
+        )
 
-	// Helper function to extract float fields
-	getFloat := func(key string) *float64 {
-		if val, exists := rawData[key]; exists {
-			switch v := val.(type) {
-			case float64:
-				return &v
-			case float32:
-				f := float64(v)
-				return &f
-			case int:
-				f := float64(v)
-				return &f
-			default:
-				return nil
-			}
-		}
-		return nil // Default to nil if not present or not a number
-	}
+        // Optionally, you can try to extract device_id and user_id
+        if val, ok := rawData["device_id"]; ok {
+            if s, ok := val.(string); ok {
+                deviceID = s
+            }
+        }
+        if deviceID == "" {
+            // Use a default if not provided
+            deviceID = defaultDeviceID
+        }
+        if val, ok := rawData["user_id"]; ok {
+            if s, ok := val.(string); ok {
+                userID = s
+            }
+        }
+        if userID == "" {
+            userID = "default-user-id"
+        }
+        if val, ok := rawData["status"]; ok {
+            if s, ok := val.(string); ok {
+                status = s
+            }
+        }
+        // relay_state might be sent as a boolean or a string.
+        if val, ok := rawData["relay_state"]; ok {
+            switch v := val.(type) {
+            case bool:
+                if v {
+                    relayState = "on"
+                } else {
+                    relayState = "off"
+                }
+            case string:
+                relayState = v
+            }
+        }
+        if val, ok := rawData["device_type"]; ok {
+            if s, ok := val.(string); ok {
+                devType = s
+            }
+        }
+        // Create and return a DeviceLog record tailored for relay updates.
+        return &DeviceLog{
+            DeviceID:   deviceID,
+            UserID:     userID,
+            CreatedAt:  time.Now(),
+            Status:     status,
+            RelayState: relayState,
+            DeviceType: devType,
+            // For relay logs you might choose to leave TempSensorReading and HumidSensorReading nil.
+        }, nil
+    }
 
-	// Extract fields with defaults
-	deviceID := getString("device_id")
-	userID := getString("user_id")
-	status := getString("status")
-	deviceType := getString("device_type")
-	relayState := getString("relay_state")
+    // If "relay_update" key is not present, process the payload as a normal sensor message.
+    // Helper functions to extract string and float values.
+    getString := func(key string) string {
+        if val, exists := rawData[key]; exists {
+            if str, ok := val.(string); ok {
+                return str
+            }
+        }
+        return "" // default to empty string if not present
+    }
+    getFloat := func(key string) *float64 {
+        if val, exists := rawData[key]; exists {
+            switch v := val.(type) {
+            case float64:
+                return &v
+            case float32:
+                f := float64(v)
+                return &f
+            case int:
+                f := float64(v)
+                return &f
+            default:
+                return nil
+            }
+        }
+        return nil // default to nil if not present
+    }
 
-	tempReading := getFloat("temp_sensor_reading")
-	humidReading := getFloat("humid_sensor_reading")
+    // Extract required fields for sensor messages.
+    deviceID := getString("device_id")
+    userID := getString("user_id")
+    status := getString("status")
+    deviceType := getString("device_type")
+    relayState := getString("relay_state") // may be empty for sensors
+    tempReading := getFloat("temp_sensor_reading")
+    humidReading := getFloat("humid_sensor_reading")
 
-	// Optional metadata field
-	var metadata *string
-	if val, exists := rawData["metadata"]; exists {
-		if str, ok := val.(string); ok {
-			metadata = &str
-		}
-	}
+    // Optional metadata field
+    var metadata *string
+    if val, exists := rawData["metadata"]; exists {
+        if str, ok := val.(string); ok {
+            metadata = &str
+        }
+    }
 
-	// Validate required fields
-	if deviceID == "" || userID == "" || deviceType == "" {
-		return nil, errors.New("missing required fields: device_id, user_id, or device_type")
-	}
+    // Validate required fields for a sensor message.
+    if deviceID == "" || userID == "" || deviceType == "" {
+        return nil, errors.New("missing required fields: device_id, user_id, or device_type")
+    }
 
-	// Create the DeviceLog struct
-	deviceLog := &DeviceLog{
-		DeviceID:           deviceID,
-		UserID:             userID,
-		CreatedAt:          time.Now(),
-		Status:             status,
-		TempSensorReading:  tempReading,
-		HumidSensorReading: humidReading,
-		RelayState:         relayState,
-		DeviceType:         deviceType,
-		Metadata:           metadata,
-	}
-
-	return deviceLog, nil
+    // Return the DeviceLog for a sensor message.
+    return &DeviceLog{
+        DeviceID:           deviceID,
+        UserID:             userID,
+        CreatedAt:          time.Now(),
+        Status:             status,
+        TempSensorReading:  tempReading,
+        HumidSensorReading: humidReading,
+        RelayState:         relayState,
+        DeviceType:         deviceType,
+        Metadata:           metadata,
+    }, nil
 }
 
 // createDummyDeviceLog creates a DeviceLog with dummy data

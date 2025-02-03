@@ -87,6 +87,10 @@ type Action struct {
 	DeviceID *string `json:"device_id,omitempty"`
 }
 
+type RelayCommand struct {
+	Power bool `json:"power"`
+}
+
 // Global variables
 var (
 	taskQueue         = make(chan Task, 1000) // Buffered channel to hold tasks
@@ -927,6 +931,32 @@ func validateSingleDeviceTrigger(trigger Trigger, payload map[string]interface{}
 	return false
 }
 
+func executeRelayAction(mqttClient mqtt.Client, userID, deviceID string, powerState bool) error {
+	// Define the MQTT topic
+	topic := fmt.Sprintf("/toDevice/%s/%s", userID, deviceID)
+
+	// Create the payload
+	payload := RelayCommand{Power: powerState}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("❌ Error marshalling relay command payload: %v", err)
+		return err
+	}
+
+	// Publish to the broker
+	token := mqttClient.Publish(topic, 0, false, payloadBytes)
+	token.Wait()
+
+	// Check if publishing was successful
+	if token.Error() != nil {
+		log.Printf("❌ Error publishing to topic %s: %v", topic, token.Error())
+		return token.Error()
+	}
+
+	log.Printf("✅ Successfully sent relay command to topic: %s", topic)
+	return nil
+}
+
 // handleTwoDeviceCompareTrigger compares the reading from the device that sent the payload
 // with the latest reading of the other device as stored in your Supabase table.
 func handleTwoDeviceCompareTrigger(trigger Trigger, payload map[string]interface{}) bool {
@@ -1052,29 +1082,45 @@ func handleTwoDeviceCompareTrigger(trigger Trigger, payload map[string]interface
 
 
 func executeActions(actions []Action, userID string) {
+	mqttClient := getMQTTClient() // Get the MQTT client instance
+
 	for _, action := range actions {
 		switch action.Type {
 		case "send_notification":
-			log.Printf("Sending notification action: %s", action.Message)
+			log.Printf("📢 Sending notification action: %s", action.Message)
 			title := "Notification"
 			msg := "You have a new notification."
 			if action.Message != nil && *action.Message != "" {
 				msg = *action.Message
 			}
-			// IMPORTANT: Replace "dummy-user-id" with the proper user ID from your context.
 			data := map[string]string{"info": "extra data if needed"}
 			err := sendPushNotificationForUser(userID, title, msg, data)
 			if err != nil {
-				log.Printf("Error sending notification for user %s: %v", userID, err)
+				log.Printf("❌ Error sending notification for user %s: %v", userID, err)
 			}
-		case "turn_on_relay":
-			log.Printf("Turning on relay for device: %s", action.DeviceID)
-			// Implement relay logic here.
+
+		case "turn_on_relay", "turn_off_relay":
+			if action.DeviceID == nil || *action.DeviceID == "" {
+				log.Printf("❌ Missing device_id in relay action. Skipping...")
+				continue
+			}
+			// Determine the relay state based on action type
+			powerState := action.Type == "turn_on_relay"
+
+			// Execute relay action
+			err := executeRelayAction(mqttClient, userID, *action.DeviceID, powerState)
+			if err != nil {
+				log.Printf("❌ Failed to execute relay action for device %s: %v", *action.DeviceID, err)
+			} else {
+				log.Printf("⚡ Relay action executed successfully: %s -> %t", *action.DeviceID, powerState)
+			}
+
 		default:
-			log.Printf("Unknown action type: %s", action.Type)
+			log.Printf("❓ Unknown action type: %s", action.Type)
 		}
 	}
 }
+
 
 func deviceAutomationHandler(task Task) {
 	log.Printf("📡 Device Automation Handler: Processing message on topic %s", task.Topic)

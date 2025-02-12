@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
+	"strconv" // required for parsing numbers
 	"strings"
 	"sync"
 	"syscall"
@@ -64,18 +64,17 @@ type DeviceLog struct {
 	Metadata           *string    `json:"metadata"`             // Optional JSON metadata
 }
 
-// Task represents an MQTT message.
+// Task structure represents an MQTT message.
 type Task struct {
 	Topic   string
 	Payload string
 }
 
 // Automation represents the structure of an automation rule.
-// Note: The field for type now matches the JSON key ("type") provided by Supabase.
 type Automation struct {
 	ID           string     `json:"id"`
 	UserID       string     `json:"user_id"`
-	Type         string     `json:"type"` // Changed from "action_type" to "type" to match your JSON input.
+	Type         string     `json:"action_type"` // "triggered" or "scheduled"
 	LastExecuted *time.Time `json:"last_executed,omitempty"`
 	LastResult   *string    `json:"last_result,omitempty"`
 	Triggers     []Trigger  `json:"triggers"`
@@ -86,7 +85,6 @@ type Automation struct {
 }
 
 // Trigger represents the structure of an automation trigger.
-// An extra field (MetricLabel) has been added to capture additional data.
 type Trigger struct {
 	Type              string          `json:"type"` // "scheduled", "single_device", "two_device_diff"
 	Condition         *string         `json:"condition,omitempty"`
@@ -94,14 +92,15 @@ type Trigger struct {
 	DaysOfWeek        []string        `json:"days_of_week,omitempty"`
 	ScheduleType      *string         `json:"schedule_type,omitempty"`
 	ConditionOperator *string         `json:"conditionOperator,omitempty"`
-	Value             *StringOrNumber `json:"value,omitempty"` // Will accept a number or a string.
+	Value             *StringOrNumber `json:"value,omitempty"` // Accepts both string and number
 	Metric            *string         `json:"metric,omitempty"`
 	DeviceID          *string         `json:"device_id,omitempty"`
 	BinID             *string         `json:"bin_id,omitempty"`
 	LocationID        *string         `json:"location_id,omitempty"`
+	// Added to match the provided JSON structure.
+	MetricLabel       *string         `json:"metricLabel,omitempty"`
 	Device1           *Device         `json:"device1,omitempty"`
 	Device2           *Device         `json:"device2,omitempty"`
-	MetricLabel       *string         `json:"metricLabel,omitempty"` // Added to accept extra fields.
 }
 
 // Device represents a device in a two-device trigger.
@@ -113,7 +112,7 @@ type Device struct {
 
 // Action represents the actions executed when an automation is triggered.
 type Action struct {
-	Type     string  `json:"type"` // "send_notification", "turn_on_relay", etc.
+	Type     string  `json:"type"` // "send_notification", "turn_on_relay"
 	Message  *string `json:"message,omitempty"`
 	DeviceID *string `json:"device_id,omitempty"`
 }
@@ -124,18 +123,18 @@ type RelayCommand struct {
 
 // Global variables.
 var (
-	taskQueue         = make(chan Task, 1000) // Buffered channel to hold tasks.
+	taskQueue         = make(chan Task, 1000) // Buffered channel for tasks.
 	maxWorkers        = 20                    // Maximum number of workers.
 	minWorkers        = 2                     // Minimum number of workers.
-	workerLock        sync.Mutex              // Mutex to protect workerCount.
+	workerLock        sync.Mutex              // Protects activeWorkers.
 	activeWorkers     = make(map[int]chan bool)
 	workerIDCounter   = 0
 	supabaseClient    *supabase.Client
 	wg                sync.WaitGroup
-	gracefulShutdown  = make(chan os.Signal, 1) // Channel to capture OS signals.
-	once              sync.Once                 // Ensures Supabase client is initialized once.
-	defaultDeviceID   = "default-device-id"     // Default device_id for plain text payloads.
-	defaultDeviceType = "relay"                 // Default device_type for plain text payloads.
+	gracefulShutdown  = make(chan os.Signal, 1) // Captures OS signals.
+	once              sync.Once                 // Ensures Supabase is initialized once.
+	defaultDeviceID   = "default-device-id"     // Default device ID.
+	defaultDeviceType = "relay"                 // Default device type.
 )
 
 var (
@@ -143,6 +142,7 @@ var (
 	mqttOnce           sync.Once
 )
 
+// getMQTTClient returns a singleton MQTT client.
 func getMQTTClient() mqtt.Client {
 	mqttOnce.Do(func() {
 		broker := "tcp://mosquitto:1883"
@@ -163,8 +163,9 @@ func getMQTTClient() mqtt.Client {
 	return mqttClientInstance
 }
 
+// handleSendCommand handles incoming HTTP POST commands.
 func handleSendCommand(w http.ResponseWriter, r *http.Request) {
-	// Handle CORS Preflight Request.
+	// Handle CORS preflight.
 	if r.Method == http.MethodOptions {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
@@ -173,10 +174,7 @@ func handleSendCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set CORS headers.
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method != http.MethodPost {
@@ -184,7 +182,6 @@ func handleSendCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse the incoming JSON.
 	var message struct {
 		DeviceID string                 `json:"deviceId"`
 		UserID   string                 `json:"userId"`
@@ -198,13 +195,11 @@ func handleSendCommand(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// Validate required fields.
 	if message.DeviceID == "" || message.UserID == "" || message.Data == nil {
 		http.Error(w, "Missing required fields: deviceId, userId, or data.", http.StatusBadRequest)
 		return
 	}
 
-	// Serialize the Data object into a JSON string.
 	dataJSON, err := json.Marshal(message.Data)
 	if err != nil {
 		log.Printf("Error serializing data to JSON: %v", err)
@@ -212,10 +207,8 @@ func handleSendCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Construct the MQTT topic.
 	topic := fmt.Sprintf("/toDevice/%s/%s", message.UserID, message.DeviceID)
 
-	// Publish the message to MQTT.
 	client := getMQTTClient()
 	token := client.Publish(topic, 0, false, dataJSON)
 	token.Wait()
@@ -226,7 +219,6 @@ func handleSendCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Respond to the client.
 	response := map[string]string{
 		"status":  "success",
 		"topic":   topic,
@@ -235,36 +227,26 @@ func handleSendCommand(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// main initializes the server and MQTT client.
 func main() {
-	// Initialize Supabase client.
 	initSupabase()
-
-	// Start dynamic scaling of workers.
 	go scheduleHandler()
 	go monitorAndScaleWorkers()
 
-	// Create the MQTT client.
 	client := getMQTTClient()
-
-	// Connect to the MQTT broker.
 	if token := client.Subscribe("/toDaemon/#", 0, nil); token.Wait() && token.Error() != nil {
 		log.Fatalf("Failed to subscribe to all topics: %v", token.Error())
 	}
 	log.Println("Subscribed to all topics!")
 
-	// Handle graceful shutdown.
 	setupGracefulShutdown(client)
-
-	// Init HTTP server.
 	http.HandleFunc("/sendComand", handleSendCommand)
 
 	fmt.Println("Starting server on :5000...")
-	err := http.ListenAndServe(":5000", nil)
-	if err != nil {
+	if err := http.ListenAndServe(":5000", nil); err != nil {
 		fmt.Println("Error starting server:", err)
 	}
 
-	// Keep the program running indefinitely.
 	select {}
 }
 
@@ -284,29 +266,25 @@ func messageHandler(client mqtt.Client, msg mqtt.Message) {
 	}
 }
 
-// initSupabase initializes the Supabase client as a singleton.
+// initSupabase initializes the Supabase client.
 func initSupabase() {
 	once.Do(func() {
-		// Load environment variables from .env file if present.
-		err := godotenv.Load()
-		if err != nil {
-			log.Println("Warning: .env file not found, falling back to system environment variables.")
+		if err := godotenv.Load(); err != nil {
+			log.Println("Warning: .env file not found, using system environment variables.")
 		}
 
 		supabaseURL := os.Getenv("SUPABASE_URL")
 		supabaseKey := os.Getenv("SUPABASE_KEY")
-
 		if supabaseURL == "" || supabaseKey == "" {
 			log.Fatal("Supabase URL or Key not set in environment variables")
 		}
 
-		// Create Supabase client.
 		supabaseClient = supabase.CreateClient(supabaseURL, supabaseKey)
 		log.Println("Connected to Supabase!")
 	})
 }
 
-// getFloatFromPayload extracts a float64 from the payload for the given key.
+// getFloatFromPayload extracts a float64 value from a payload.
 func getFloatFromPayload(payload map[string]interface{}, key string) (float64, bool) {
 	if val, exists := payload[key]; exists {
 		switch v := val.(type) {
@@ -329,7 +307,6 @@ func getFloatFromPayload(payload map[string]interface{}, key string) (float64, b
 func worker(id int, stopWorkerCh chan bool) {
 	log.Printf("Worker %d started", id)
 	defer wg.Done()
-
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("Worker %d recovered from panic: %v", id, r)
@@ -340,22 +317,14 @@ func worker(id int, stopWorkerCh chan bool) {
 		select {
 		case task := <-taskQueue:
 			log.Printf("Worker %d processing task: %s on topic %s", id, task.Payload, task.Topic)
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("Worker %d recovered from panic: %v", id, r)
-				}
-			}()
 			deviceLog, err := parsePayload(task.Topic, task.Payload)
 			if err != nil {
 				log.Printf("Worker %d failed to parse payload: %v", id, err)
 				continue
 			}
-
-			err = insertIntoSupabase(deviceLog)
-			if err != nil {
+			if err := insertIntoSupabase(deviceLog); err != nil {
 				log.Printf("Worker %d failed to insert into Supabase: %v", id, err)
 			}
-
 		case <-stopWorkerCh:
 			log.Printf("Worker %d stopping", id)
 			return
@@ -363,20 +332,16 @@ func worker(id int, stopWorkerCh chan bool) {
 	}
 }
 
-// parsePayload parses the MQTT payload and returns a DeviceLog struct.
+// parsePayload converts an MQTT payload into a DeviceLog.
 func parsePayload(topic, payload string) (*DeviceLog, error) {
-	// First, attempt to parse the payload as JSON.
 	var rawData map[string]interface{}
-	err := json.Unmarshal([]byte(payload), &rawData)
-	if err != nil {
-		// If the payload is not valid JSON, fall back to creating dummy data.
+	if err := json.Unmarshal([]byte(payload), &rawData); err != nil {
 		log.Printf("Payload is not JSON: %s. Inserting dummy data.", payload)
 		return createDummyDeviceLog(topic, payload), nil
 	}
 
-	// Check for the relay_update key.
-	if _, isRelayUpdate := rawData["relay_update"]; isRelayUpdate {
-		// Process as a relay update message.
+	// Check for relay_update key.
+	if _, ok := rawData["relay_update"]; ok {
 		var (
 			deviceID   string
 			userID     string
@@ -384,7 +349,6 @@ func parsePayload(topic, payload string) (*DeviceLog, error) {
 			relayState string
 			devType    string
 		)
-
 		if val, ok := rawData["device_id"]; ok {
 			if s, ok := val.(string); ok {
 				deviceID = s
@@ -433,11 +397,11 @@ func parsePayload(topic, payload string) (*DeviceLog, error) {
 		}, nil
 	}
 
-	// Process as a sensor message.
+	// For sensor messages.
 	getString := func(key string) string {
 		if val, exists := rawData[key]; exists {
-			if str, ok := val.(string); ok {
-				return str
+			if s, ok := val.(string); ok {
+				return s
 			}
 		}
 		return ""
@@ -470,8 +434,8 @@ func parsePayload(topic, payload string) (*DeviceLog, error) {
 
 	var metadata *string
 	if val, exists := rawData["metadata"]; exists {
-		if str, ok := val.(string); ok {
-			metadata = &str
+		if s, ok := val.(string); ok {
+			metadata = &s
 		}
 	}
 
@@ -492,7 +456,7 @@ func parsePayload(topic, payload string) (*DeviceLog, error) {
 	}, nil
 }
 
-// createDummyDeviceLog creates a DeviceLog with dummy data.
+// createDummyDeviceLog creates a dummy DeviceLog.
 func createDummyDeviceLog(topic, payload string) *DeviceLog {
 	parts := strings.Split(topic, "/")
 	userID := ""
@@ -505,24 +469,19 @@ func createDummyDeviceLog(topic, payload string) *DeviceLog {
 	if userID == "" {
 		userID = "default-user-id"
 	}
-	deviceID := defaultDeviceID
-	status := payload
-	deviceType := defaultDeviceType
-	relayState := "idle"
-	var metadata *string
 
 	return &DeviceLog{
-		DeviceID:   deviceID,
+		DeviceID:   defaultDeviceID,
 		UserID:     userID,
 		CreatedAt:  time.Now(),
-		Status:     status,
-		DeviceType: deviceType,
-		RelayState: relayState,
-		Metadata:   metadata,
+		Status:     payload,
+		DeviceType: defaultDeviceType,
+		RelayState: "idle",
+		Metadata:   nil,
 	}
 }
 
-// insertIntoSupabase inserts a single DeviceLog into Supabase.
+// insertIntoSupabase inserts a DeviceLog into Supabase.
 func insertIntoSupabase(deviceLog *DeviceLog) error {
 	data := map[string]interface{}{
 		"device_id":            deviceLog.DeviceID,
@@ -541,7 +500,7 @@ func insertIntoSupabase(deviceLog *DeviceLog) error {
 	return nil
 }
 
-// batchInsertIntoSupabase inserts multiple DeviceLogs into Supabase in a single batch.
+// batchInsertIntoSupabase inserts multiple DeviceLogs into Supabase.
 func batchInsertIntoSupabase(deviceLogs []*DeviceLog) error {
 	var data []map[string]interface{}
 	for _, logEntry := range deviceLogs {
@@ -564,11 +523,11 @@ func batchInsertIntoSupabase(deviceLogs []*DeviceLog) error {
 }
 
 const (
-	workerScaleThreshold   = 0.8 // 80% of maxWorkers.
-	queueOverloadThreshold = 0.8 // 80% of queue capacity.
+	workerScaleThreshold   = 0.8 // 80% of maxWorkers
+	queueOverloadThreshold = 0.8 // 80% of queue capacity
 )
 
-// monitorAndScaleWorkers dynamically scales the number of workers based on the taskQueue size.
+// monitorAndScaleWorkers dynamically scales the number of workers.
 func monitorAndScaleWorkers() {
 	for {
 		queueSize := len(taskQueue)
@@ -577,12 +536,13 @@ func monitorAndScaleWorkers() {
 		queueCapacity := float64(cap(taskQueue)) * queueOverloadThreshold
 
 		workerLock.Lock()
-
 		if float64(currentWorkers) > workerCapacity {
-			log.Printf("⚠️ WARNING: Worker pool is at %.0f%% capacity (%d/%d workers in use).", (float64(currentWorkers)/float64(maxWorkers))*100, currentWorkers, maxWorkers)
+			log.Printf("⚠️ WARNING: Worker pool is at %.0f%% capacity (%d/%d workers in use).",
+				(float64(currentWorkers)/float64(maxWorkers))*100, currentWorkers, maxWorkers)
 		}
 		if currentWorkers >= maxWorkers {
-			log.Printf("🚨 ALERT: Worker pool has reached max capacity (%d/%d workers). Incoming tasks may experience delays.", currentWorkers, maxWorkers)
+			log.Printf("🚨 ALERT: Worker pool has reached max capacity (%d/%d workers). Incoming tasks may experience delays.",
+				currentWorkers, maxWorkers)
 		}
 		if queueSize > currentWorkers && currentWorkers < maxWorkers {
 			workerIDCounter++
@@ -604,7 +564,8 @@ func monitorAndScaleWorkers() {
 			}
 		}
 		if float64(queueSize) > queueCapacity {
-			log.Printf("⚠️ WARNING: Task queue is at %.0f%% capacity (%d/%d tasks in queue).", (float64(queueSize)/float64(cap(taskQueue)))*100, queueSize, cap(taskQueue))
+			log.Printf("⚠️ WARNING: Task queue is at %.0f%% capacity (%d/%d tasks in queue).",
+				(float64(queueSize)/float64(cap(taskQueue)))*100, queueSize, cap(taskQueue))
 		}
 		if queueSize == cap(taskQueue) {
 			log.Printf("🚨 ALERT: Task queue is FULL (%d tasks). Incoming messages may be dropped.", queueSize)
@@ -614,30 +575,27 @@ func monitorAndScaleWorkers() {
 	}
 }
 
-// setupGracefulShutdown handles termination signals to shut down workers gracefully.
+// setupGracefulShutdown gracefully shuts down on termination signals.
 func setupGracefulShutdown(client mqtt.Client) {
 	signal.Notify(gracefulShutdown, syscall.SIGINT, syscall.SIGTERM)
-
 	go func() {
 		sig := <-gracefulShutdown
 		log.Printf("Received signal: %v. Initiating shutdown...", sig)
 		client.Disconnect(250)
 		log.Println("Disconnected from MQTT broker.")
-
 		workerLock.Lock()
 		for workerID, stopCh := range activeWorkers {
 			close(stopCh)
 			log.Printf("Stopped worker %d", workerID)
 		}
 		workerLock.Unlock()
-
 		wg.Wait()
 		log.Println("All workers have been stopped.")
 		os.Exit(0)
 	}()
 }
 
-// updateAutomationLastExecuted updates the automation record's last_executed field in Supabase.
+// updateAutomationLastExecuted updates the automation's last_executed field.
 func updateAutomationLastExecuted(automationID string, ts time.Time) error {
 	data := map[string]interface{}{
 		"last_executed": ts.Format(time.RFC3339),
@@ -652,7 +610,19 @@ func updateAutomationLastExecuted(automationID string, ts time.Time) error {
 	return nil
 }
 
-// evaluateTriggers is used for non-scheduled (device-based) triggers.
+// evaluateSensorTrigger logs details about a sensor-based trigger (stub function).
+func evaluateSensorTrigger(trigger Trigger) bool {
+	b, err := json.MarshalIndent(trigger, "", "  ")
+	if err != nil {
+		log.Printf("Error marshalling trigger: %v", err)
+	} else {
+		log.Printf("Evaluating Sensor Trigger: %s", b)
+	}
+	// TODO: Implement sensor evaluation logic.
+	return false
+}
+
+// evaluateTriggers iterates through triggers and combines their evaluations.
 func evaluateTriggers(triggers []Trigger, payload map[string]interface{}) bool {
 	var result bool
 	for i, trigger := range triggers {
@@ -688,6 +658,7 @@ func evaluateTriggers(triggers []Trigger, payload map[string]interface{}) bool {
 	return result
 }
 
+// mapTimezoneOffset returns the UTC offset for a given timezone.
 func mapTimezoneOffset(tz string) int {
 	mapping := map[string]int{
 		"America/New_York":    -5,
@@ -714,9 +685,9 @@ func mapTimezoneOffset(tz string) int {
 		"America/Vancouver":   -8,
 		"America/Whitehorse":  -8,
 		"America/Anchorage": -9,
-		"America/Adak":      -10,
-		"America/Halifax":   -4,
-		"America/St_Johns":  -3,
+		"America/Adak": -10,
+		"America/Halifax": -4,
+		"America/St_Johns": -3,
 	}
 	if offset, ok := mapping[tz]; ok {
 		return offset
@@ -724,15 +695,15 @@ func mapTimezoneOffset(tz string) int {
 	return 0
 }
 
-// evaluateScheduledTrigger checks if the scheduled trigger should fire.
+// evaluateScheduledTrigger checks if a scheduled trigger should fire.
 func evaluateScheduledTrigger(automation Automation, trigger Trigger) bool {
 	offsetHours := mapTimezoneOffset(automation.Timezone)
 	loc := time.FixedZone(automation.Timezone, offsetHours*3600)
 	localNow := time.Now().In(loc)
 	log.Printf("DEBUG: Current local time in %s: %s", automation.Timezone, localNow.Format("15:04:05"))
+
 	currentDay := localNow.Weekday().String()
 	log.Printf("DEBUG: Current day: %s, Trigger days: %v", currentDay, trigger.DaysOfWeek)
-
 	found := false
 	for _, day := range trigger.DaysOfWeek {
 		if strings.EqualFold(day, currentDay) {
@@ -758,6 +729,7 @@ func evaluateScheduledTrigger(automation Automation, trigger Trigger) bool {
 
 	scheduledTime := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), commonTime.Hour(), commonTime.Minute(), 0, 0, loc)
 	log.Printf("DEBUG: Scheduled time: %s", scheduledTime.Format("15:04:05"))
+
 	tolerance := 3 * time.Minute
 	diff := localNow.Sub(scheduledTime)
 	if diff < 0 {
@@ -783,6 +755,7 @@ func evaluateScheduledTrigger(automation Automation, trigger Trigger) bool {
 	return true
 }
 
+// scheduleHandler periodically checks for scheduled automations.
 func scheduleHandler() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
@@ -791,7 +764,7 @@ func scheduleHandler() {
 		var automations []Automation
 		err := supabaseClient.DB.From("user_automations").
 			Select("*").
-			Eq("type", "scheduled"). // Ensure the query key matches the struct.
+			Eq("action_type", "scheduled").
 			Execute(&automations)
 		if err != nil {
 			log.Printf("❌ Error fetching scheduled automations: %v", err)
@@ -819,7 +792,7 @@ func scheduleHandler() {
 	}
 }
 
-// sendPushNotificationForUser queries the notifications table and sends a push notification using the Expo SDK.
+// sendPushNotificationForUser sends a push notification using the Expo SDK.
 func sendPushNotificationForUser(userID, title, message string, data map[string]string) error {
 	var notifications []struct {
 		ExpoPushToken string `json:"expo_push_token"`
@@ -869,7 +842,7 @@ func sendPushNotificationForUser(userID, title, message string, data map[string]
 	return nil
 }
 
-// validateSingleDeviceTrigger checks a "single_device" trigger against the device payload.
+// validateSingleDeviceTrigger checks a "single_device" trigger against the payload.
 func validateSingleDeviceTrigger(trigger Trigger, payload map[string]interface{}) bool {
 	if trigger.DeviceID != nil && *trigger.DeviceID != "" {
 		payloadDeviceID, ok := payload["device_id"].(string)
@@ -905,14 +878,17 @@ func validateSingleDeviceTrigger(trigger Trigger, payload map[string]interface{}
 		log.Println("Single device trigger: no value specified")
 		return false
 	}
-	triggerValue, err := strconv.ParseFloat(string(*trigger.Value), 64)
+	rawTriggerValue := string(*trigger.Value)
+	log.Printf("validateSingleDeviceTrigger: sensor value = %v, trigger raw value = %s", sensorValue, rawTriggerValue)
+	triggerValue, err := strconv.ParseFloat(rawTriggerValue, 64)
 	if err != nil {
-		log.Printf("Single device trigger: error parsing trigger value '%s': %v", string(*trigger.Value), err)
+		log.Printf("Single device trigger: error parsing trigger value '%s': %v", rawTriggerValue, err)
 		return false
 	}
 
 	if trigger.Condition != nil {
 		cond := strings.ToLower(*trigger.Condition)
+		log.Printf("Condition operator: %s", cond)
 		switch cond {
 		case "gt":
 			return sensorValue > triggerValue
@@ -933,6 +909,7 @@ func validateSingleDeviceTrigger(trigger Trigger, payload map[string]interface{}
 	return false
 }
 
+// executeRelayAction sends a relay command via MQTT.
 func executeRelayAction(mqttClient mqtt.Client, userID, deviceID string, powerState bool) error {
 	topic := fmt.Sprintf("/toDevice/%s/%s", userID, deviceID)
 	payload := RelayCommand{Power: powerState}
@@ -941,20 +918,17 @@ func executeRelayAction(mqttClient mqtt.Client, userID, deviceID string, powerSt
 		log.Printf("❌ Error marshalling relay command payload: %v", err)
 		return err
 	}
-
 	token := mqttClient.Publish(topic, 0, false, payloadBytes)
 	token.Wait()
-
 	if token.Error() != nil {
 		log.Printf("❌ Error publishing to topic %s: %v", topic, token.Error())
 		return token.Error()
 	}
-
 	log.Printf("✅ Successfully sent relay command to topic: %s", topic)
 	return nil
 }
 
-// handleTwoDeviceCompareTrigger compares the reading from the device that sent the payload with the latest reading of the other device.
+// handleTwoDeviceCompareTrigger compares a sensor value from one device to the latest log of another.
 func handleTwoDeviceCompareTrigger(trigger Trigger, payload map[string]interface{}) bool {
 	if trigger.Device1 == nil || trigger.Device2 == nil {
 		log.Println("Two device trigger: Device1 or Device2 is nil")
@@ -1005,7 +979,6 @@ func handleTwoDeviceCompareTrigger(trigger Trigger, payload map[string]interface
 		OrderBy("created_at", "desc").Limit(1).
 		Eq("device_id", otherDeviceID).
 		Execute(&logs)
-
 	if res.Error() != "" || len(logs) == 0 {
 		log.Printf("Two device trigger: failed to fetch latest log for device %s", otherDeviceID)
 		return false
@@ -1036,20 +1009,23 @@ func handleTwoDeviceCompareTrigger(trigger Trigger, payload map[string]interface
 	if diff < 0 {
 		diff = -diff
 	}
+	log.Printf("Two device trigger: currentValue = %v, otherValue = %v, diff = %v", currentValue, otherValue, diff)
 
 	if trigger.Value == nil {
 		log.Println("Two device trigger: Trigger value is nil")
 		return false
 	}
-
-	triggerValue, err := strconv.ParseFloat(string(*trigger.Value), 64)
+	rawTriggerValue := string(*trigger.Value)
+	log.Printf("handleTwoDeviceCompareTrigger: raw trigger value = %s", rawTriggerValue)
+	triggerValue, err := strconv.ParseFloat(rawTriggerValue, 64)
 	if err != nil {
-		log.Printf("Two device trigger: Error parsing trigger value '%s': %v", string(*trigger.Value), err)
+		log.Printf("Two device trigger: Error parsing trigger value '%s': %v", rawTriggerValue, err)
 		return false
 	}
 
 	if trigger.Condition != nil {
 		cond := strings.ToLower(*trigger.Condition)
+		log.Printf("Two device trigger: condition operator = %s, triggerValue = %v", cond, triggerValue)
 		switch cond {
 		case "gt":
 			return diff > triggerValue
@@ -1070,43 +1046,40 @@ func handleTwoDeviceCompareTrigger(trigger Trigger, payload map[string]interface
 	return false
 }
 
+// executeActions executes each action for a given automation.
 func executeActions(actions []Action, userID string) {
 	mqttClient := getMQTTClient()
-
 	for _, action := range actions {
 		switch action.Type {
 		case "send_notification":
-			log.Printf("📢 Sending notification action: %s", action.Message)
+			log.Printf("📢 Sending notification action: %v", action.Message)
 			title := "Notification"
 			msg := "You have a new notification."
 			if action.Message != nil && *action.Message != "" {
 				msg = *action.Message
 			}
 			data := map[string]string{"info": "extra data if needed"}
-			err := sendPushNotificationForUser(userID, title, msg, data)
-			if err != nil {
+			if err := sendPushNotificationForUser(userID, title, msg, data); err != nil {
 				log.Printf("❌ Error sending notification for user %s: %v", userID, err)
 			}
-
 		case "turn_on_relay", "turn_off_relay":
 			if action.DeviceID == nil || *action.DeviceID == "" {
 				log.Printf("❌ Missing device_id in relay action. Skipping...")
 				continue
 			}
 			powerState := action.Type == "turn_on_relay"
-			err := executeRelayAction(mqttClient, userID, *action.DeviceID, powerState)
-			if err != nil {
+			if err := executeRelayAction(mqttClient, userID, *action.DeviceID, powerState); err != nil {
 				log.Printf("❌ Failed to execute relay action for device %s: %v", *action.DeviceID, err)
 			} else {
 				log.Printf("⚡ Relay action executed successfully: %s -> %t", *action.DeviceID, powerState)
 			}
-
 		default:
 			log.Printf("❓ Unknown action type: %s", action.Type)
 		}
 	}
 }
 
+// deviceAutomationHandler processes an incoming MQTT task.
 func deviceAutomationHandler(task Task) {
 	log.Printf("📡 Device Automation Handler: Processing message on topic %s", task.Topic)
 	var payload map[string]interface{}
